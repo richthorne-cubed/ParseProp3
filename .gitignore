@@ -1,0 +1,10 @@
+/__pycache__
+*.pdf
+image.py
+profiles.json
+prompt.txt
+read_pdfs.py
+sigh.bat
+todo.txt
+Validate JSON.bat
+validate_json.py

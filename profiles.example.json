@@ -1,0 +1,118 @@
+[
+ {
+  "profileName": "Agency One",
+  "matchStrings": [
+   "AgencyOneLettings.co.uk"
+   ],
+  "ignoreBefore": 300,
+  "amountAfter": 480,
+  "amountBefore": 550,
+  "descAfter": 110,
+  "descBefore": 345,
+  "descIgnore": [
+   "Subtotal"
+  ],
+  "descsOutsideRange": [
+   "Closing Balance"
+  ],
+  "descWrapMax": 12,
+  "finalRowContains": [
+   "Closing",
+   "Balance"
+  ],
+  "signBy": "rows",
+  "signHeaders": [
+   {
+    "text": "Income",
+    "sign": "positive"
+   },
+   {
+    "text": "Expenditure",
+    "sign": "negative"
+   },
+   {
+    "text": "Landlord Payments",
+    "sign": "negative"
+   }
+  ],
+  "properties": [
+   {
+    "address": "123 Fake Street",
+    "xeroTrackingOption": "123 Fake Street (HMO: OWNED)"
+   },
+   {
+    "address": "9 Baker Street",
+    "xeroTrackingOption": "9 Baker Street (HMO: OWNED)"
+   }
+  ],
+  "xeroTrackingCategory1": "Properties",
+  "accountCodes": {
+   "rent":			200,
+   "mgmt":			476,
+   "lettingfee":		470,
+   "cleaning":		472,
+   "gardening":		471,
+   "safety":			475,
+   "maintenance":	474,
+   "utils":			435,
+   "balance":		689,
+   "prepayments":	620
+  }
+ },
+ {
+  "profileName": "AgencyTwo",
+  "matchStrings": [
+   "AgencyTwoLettings.co.uk"
+   ],
+  "ignoreBefore": 300,
+  "amountAfter": 425,
+  "amountBefore": 550,
+  "descAfter": 110,
+  "descBefore": 420,
+  "descIgnore": [
+   "Subtotal"
+  ],
+  "descsOutsideRange": [
+   ""
+  ],
+  "descWrapMax": 12,
+  "finalRowContains": [
+   "Closing",
+   "Balance"
+  ],
+  "signBy": "columns",
+  "signCols": [
+   {
+    "name": "Payments",
+    "sign": "negative",
+    "amountAfter": 425,
+    "amountBefore": 480
+   },
+   {
+    "name": "Receipts",
+    "sign": "positive",
+    "amountAfter": 485,
+    "amountBefore": 545
+   }
+  ],
+  "properties": [
+   {
+    "address": "10 Downing Street",
+    "xeroTrackingOption": "10 Downing Street (HMO: OWNED)"
+   }
+  ],
+  "xeroTrackingCategory1": "Properties",
+  "accountCodes": {
+   "rent":			200,
+   "mgmt":			476,
+   "lettingfee":		470,
+   "cleaning":		472,
+   "gardening":		471,
+   "safety":			475,
+   "maintenance":	474,
+   "utils":			435,
+   "balance":		689,
+   "prepayments":	620
+  }
+ }
+]

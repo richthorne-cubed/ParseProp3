@@ -1,0 +1,48 @@
+{
+ "descTypeMatch": {
+  "rent": [
+   "rent for period",
+   "rent received",
+   "received from",
+   "rent from"
+  ],
+  "mgmt":	[
+   "management fee",
+   "commission fee",
+   "renewal fee"
+  ],
+  "lettingfee":	[
+   "tenant find fee",
+   "letting fee",
+   "tenancy renewal"
+  ],
+  "cleaning": [
+   "cleaning",
+   "communal clean"
+  ],
+  "gardening":	[
+   "garden",
+   "weed",
+   "lawn",
+   "hedge"
+   ],
+  "safety":	[
+   "gas safety",
+   "certificate",
+   "compliance",
+   "smoke detector test",
+   "pat test"
+  ],
+  "balance": [
+   "balance brought forward",
+   "balance carried forward",
+   "opening balance",
+   "closing balance",
+   "payment to landlord",
+   "total remitted"
+  ],
+  "prepayments":	[
+   "payment received with thanks"
+  ]
+ }
+}
