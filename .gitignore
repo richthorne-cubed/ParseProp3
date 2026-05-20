@@ -8,3 +8,5 @@ sigh.bat
 todo.txt
 Validate JSON.bat
 validate_json.py
+localconfig.json
+localtokens.json

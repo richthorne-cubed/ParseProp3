@@ -56,6 +56,48 @@
       white-space: nowrap;
     }
 
+    .top-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+    }
+
+    .xero-status {
+      color: var(--muted);
+      font-size: 13px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .xero-button {
+      min-height: 34px;
+      padding: 6px 12px;
+      border: 1px solid var(--control-line);
+      border-radius: 4px;
+      background: var(--control);
+      color: var(--text);
+      cursor: pointer;
+      font: inherit;
+      white-space: nowrap;
+    }
+
+    .xero-button:hover {
+      background: #ffffff;
+    }
+
+    .debug-link {
+      color: var(--muted);
+      font-size: 13px;
+      text-decoration: none;
+    }
+
+    .debug-link:hover {
+      color: var(--accent);
+      text-decoration: underline;
+    }
+
     main {
       display: flex;
       flex-direction: column;
@@ -212,7 +254,13 @@
 <body>
   <header>
     <h1>ParseProp Preview</h1>
-    <div class="summary" id="summary"></div>
+    <div class="top-actions">
+      <div class="summary" id="summary"></div>
+      <div class="xero-status" id="xero-status"></div>
+      <button class="xero-button" id="xero-connect" type="button">Connect Xero</button>
+      <a class="debug-link" href="/xero/inspect-auth" target="_blank" rel="noopener">Inspect auth URL</a>
+      <a class="debug-link" href="/xero/debug" target="_blank" rel="noopener">OAuth debug</a>
+    </div>
   </header>
   <main id="documents">
     <div class="empty">Loading...</div>
@@ -337,10 +385,50 @@
       });
     }
 
+    async function loadXeroStatus() {
+      const statusEl = document.getElementById("xero-status");
+      const button = document.getElementById("xero-connect");
+
+      try {
+        const response = await fetch("/xero/status");
+        const status = await response.json();
+
+        if (!status.configured) {
+          statusEl.textContent = "Xero config missing";
+          button.disabled = true;
+          return;
+        }
+
+        if (status.connected) {
+          statusEl.textContent = `Xero: ${status.tenantName || "connected"}`;
+          button.textContent = "Reconnect Xero";
+          return;
+        }
+
+        if (status.identityConnected) {
+          statusEl.textContent = "Xero: identity connected, no organisation";
+          button.textContent = "Reconnect Xero";
+          return;
+        }
+
+        statusEl.textContent = "Xero: not connected";
+        button.textContent = "Connect Xero";
+      } catch (error) {
+        statusEl.textContent = "Xero status unavailable";
+        button.disabled = true;
+      }
+    }
+
+    document.getElementById("xero-connect").addEventListener("click", () => {
+      window.open("/xero/connect", "_blank", "noopener");
+    });
+
     loadPreview().catch((error) => {
       document.getElementById("documents").innerHTML =
         `<div class="empty">${error.message}</div>`;
     });
+    loadXeroStatus();
+    setInterval(loadXeroStatus, 5000);
   </script>
 </body>
 </html>

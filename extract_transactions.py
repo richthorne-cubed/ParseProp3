@@ -1,14 +1,21 @@
 import argparse
+import base64
+import hashlib
+import html
 import json
 import re
+import secrets
 import sys
 import threading
+import time
 import webbrowser
 from collections import defaultdict
 from decimal import Decimal, InvalidOperation
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
+from urllib.request import Request, urlopen
 
 import pdfplumber
 
@@ -16,6 +23,19 @@ import pdfplumber
 PROFILES_PATH = Path(__file__).with_name("profiles.json")
 GLOBAL_SETTINGS_PATH = Path(__file__).with_name("globalsettings.json")
 PREVIEW_TEMPLATE_PATH = Path(__file__).with_name("preview.html")
+LOCAL_CONFIG_PATH = Path(__file__).with_name("localconfig.json")
+LOCAL_TOKEN_PATH = Path(__file__).with_name("localtokens.json")
+XERO_AUTHORIZE_URL = "https://login.xero.com/identity/connect/authorize"
+XERO_TOKEN_URL = "https://identity.xero.com/connect/token"
+XERO_CONNECTIONS_URL = "https://api.xero.com/connections"
+DEFAULT_XERO_SCOPES = [
+    "openid",
+    "profile",
+    "email",
+    "offline_access",
+    "accounting.invoices",
+    "accounting.settings.read",
+]
 AMOUNT_RE = re.compile(r"^(?:\u00c2?\u00a3)?[0-9][0-9,]*\.[0-9]+$")
 CID_ARTIFACT_RE = re.compile(r"\(cid:\d+\)")
 DESCRIPTION_REPLACEMENTS = {
@@ -47,6 +67,51 @@ def load_profiles():
 
 def load_global_settings():
     return load_json_file(GLOBAL_SETTINGS_PATH)
+
+
+def load_local_config():
+    if not LOCAL_CONFIG_PATH.exists():
+        return {}
+    return load_json_file(LOCAL_CONFIG_PATH)
+
+
+def load_local_tokens():
+    if not LOCAL_TOKEN_PATH.exists():
+        return {}
+    return load_json_file(LOCAL_TOKEN_PATH)
+
+
+def save_local_tokens(tokens):
+    with LOCAL_TOKEN_PATH.open("w", encoding="utf-8") as f:
+        json.dump(tokens, f, indent=2)
+        f.write("\n")
+
+
+def configured_port(local_config, requested_port):
+    if requested_port:
+        return requested_port
+
+    redirect_uri = local_config.get("redirectUri")
+    if not redirect_uri:
+        return 0
+
+    parsed = urlparse(redirect_uri)
+    if parsed.hostname in {"127.0.0.1", "localhost"} and parsed.port:
+        return parsed.port
+
+    return 0
+
+
+def configured_host(local_config):
+    redirect_uri = local_config.get("redirectUri")
+    if not redirect_uri:
+        return "127.0.0.1"
+
+    parsed = urlparse(redirect_uri)
+    if parsed.hostname in {"127.0.0.1", "localhost"}:
+        return parsed.hostname
+
+    return "127.0.0.1"
 
 
 def extract_pdf_words(pdf_path):
@@ -426,9 +491,205 @@ def preview_json(documents):
     return json.dumps(payload).encode("utf-8")
 
 
-def make_preview_handler(documents):
+def public_xero_status(local_config):
+    if not local_config.get("clientId") or not local_config.get("redirectUri"):
+        return {
+            "configured": False,
+            "connected": False,
+            "message": "Xero config missing",
+        }
+
+    tokens = load_local_tokens()
+    connections = tokens.get("connections", [])
+    selected_tenant_id = tokens.get("selectedTenantId")
+    identity_connected = bool(tokens.get("refresh_token"))
+    selected = None
+    for connection in connections:
+        if connection.get("tenantId") == selected_tenant_id:
+            selected = connection
+            break
+
+    return {
+        "configured": True,
+        "identityConnected": identity_connected,
+        "connected": bool(identity_connected and selected_tenant_id),
+        "tenantCount": len(connections),
+        "tenantId": selected_tenant_id,
+        "tenantName": selected.get("tenantName") if selected else "",
+        "scopes": tokens.get("scope", ""),
+        "message": "Connected" if selected_tenant_id else (
+            "Xero identity connected, no organisation access"
+            if identity_connected
+            else "Not connected"
+        ),
+    }
+
+
+def pkce_verifier():
+    return secrets.token_urlsafe(64)
+
+
+def pkce_challenge(verifier):
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+
+def xero_scopes(local_config):
+    return local_config.get("scopes") or DEFAULT_XERO_SCOPES
+
+
+def xero_authorize_url(local_config, auth_state):
+    client_id = local_config.get("clientId")
+    redirect_uri = local_config.get("redirectUri")
+    if not client_id or not redirect_uri:
+        raise ValueError("localconfig.json must include clientId and redirectUri.")
+
+    state = secrets.token_urlsafe(32)
+    verifier = pkce_verifier()
+    auth_state.clear()
+    auth_state.update(
+        {
+            "state": state,
+            "verifier": verifier,
+            "createdAt": time.time(),
+        }
+    )
+
+    query = urlencode(
+        {
+            "client_id": client_id,
+            "response_type": "code",
+            "scope": " ".join(xero_scopes(local_config)),
+            "redirect_uri": redirect_uri,
+            "state": state,
+            "code_challenge": pkce_challenge(verifier),
+            "code_challenge_method": "S256",
+        },
+        quote_via=quote,
+    )
+    return f"{XERO_AUTHORIZE_URL}?{query}"
+
+
+def xero_authorize_parts(local_config, auth_state):
+    url = xero_authorize_url(local_config, auth_state)
+    parsed = urlparse(url)
+    return {
+        "url": url,
+        "baseUrl": f"{parsed.scheme}://{parsed.netloc}{parsed.path}",
+        "params": {
+            key: values[0]
+            for key, values in parse_qs(parsed.query).items()
+            if key != "client_id"
+        },
+        "clientIdTail": (local_config.get("clientId") or "")[-6:],
+    }
+
+
+def xero_debug_info(local_config, server_port):
+    redirect_uri = local_config.get("redirectUri", "")
+    parsed = urlparse(redirect_uri)
+    configured_scopes = xero_scopes(local_config)
+    return {
+        "hasClientId": bool(local_config.get("clientId")),
+        "clientIdTail": (local_config.get("clientId") or "")[-6:],
+        "redirectUri": redirect_uri,
+        "redirectHost": parsed.hostname or "",
+        "redirectPort": parsed.port,
+        "redirectPath": parsed.path,
+        "serverPort": server_port,
+        "redirectMatchesServer": parsed.port == server_port,
+        "scopes": configured_scopes,
+        "authorizeEndpoint": XERO_AUTHORIZE_URL,
+        "checks": [
+            "The redirect URI must be registered exactly in the Xero developer app.",
+            "127.0.0.1 and localhost are different redirect URIs.",
+            "The port and /xero/callback path must match exactly.",
+            "For a desktop/local app, the Xero app should support PKCE and must not require a client secret.",
+            "Apps created after 2 March 2026 should use granular scopes such as accounting.invoices, not accounting.transactions.",
+            "Xero examples commonly include openid, profile and email alongside accounting scopes.",
+        ],
+    }
+
+
+def read_http_error(exc):
+    try:
+        return exc.read().decode("utf-8", errors="replace")
+    except Exception:
+        return str(exc)
+
+
+def xero_post_token(form):
+    body = urlencode(form).encode("utf-8")
+    request = Request(
+        XERO_TOKEN_URL,
+        data=body,
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        method="POST",
+    )
+
+    try:
+        with urlopen(request, timeout=30) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        raise ValueError(f"Xero token request failed: {read_http_error(exc)}") from exc
+    except URLError as exc:
+        raise ValueError(f"Xero token request failed: {exc.reason}") from exc
+
+
+def xero_get_connections(access_token):
+    request = Request(
+        XERO_CONNECTIONS_URL,
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {access_token}",
+        },
+    )
+
+    try:
+        with urlopen(request, timeout=30) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        raise ValueError(f"Xero connections request failed: {read_http_error(exc)}") from exc
+    except URLError as exc:
+        raise ValueError(f"Xero connections request failed: {exc.reason}") from exc
+
+
+def exchange_xero_code(code, local_config, auth_state):
+    verifier = auth_state.get("verifier")
+    if not verifier:
+        raise ValueError("No active Xero auth request found. Start the connection again.")
+
+    token_set = xero_post_token(
+        {
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": local_config["redirectUri"],
+            "client_id": local_config["clientId"],
+            "code_verifier": verifier,
+        }
+    )
+    connections = xero_get_connections(token_set["access_token"])
+    selected_tenant_id = connections[0]["tenantId"] if len(connections) == 1 else ""
+
+    save_local_tokens(
+        {
+            **token_set,
+            "obtainedAt": int(time.time()),
+            "connections": connections,
+            "selectedTenantId": selected_tenant_id,
+        }
+    )
+
+    return connections
+
+
+def make_preview_handler(documents, local_config, server_port):
     pdf_paths = [Path(document["path"]) for document in documents]
     data = preview_json(documents)
+    auth_state = {}
 
     class PreviewHandler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -444,6 +705,26 @@ def make_preview_handler(documents):
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
+                return
+
+            if path == "/xero/status":
+                self.send_json(public_xero_status(local_config))
+                return
+
+            if path == "/xero/debug":
+                self.send_json(xero_debug_info(local_config, server_port))
+                return
+
+            if path == "/xero/connect":
+                self.redirect_to_xero(local_config, auth_state)
+                return
+
+            if path == "/xero/inspect-auth":
+                self.inspect_xero_auth(local_config, auth_state)
+                return
+
+            if path == "/xero/callback":
+                self.handle_xero_callback(local_config, auth_state)
                 return
 
             if path.startswith("/pdf/"):
@@ -464,6 +745,114 @@ def make_preview_handler(documents):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        def send_json(self, payload):
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def send_html_message(self, title, message):
+            body = (
+                "<!doctype html><html><head><meta charset=\"utf-8\">"
+                f"<title>{html.escape(title)}</title></head><body>"
+                f"<h1>{html.escape(title)}</h1><p>{html.escape(message)}</p>"
+                "</body></html>"
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def redirect_to_xero(self, config, state):
+            try:
+                url = xero_authorize_url(config, state)
+            except ValueError as exc:
+                self.send_error(400, str(exc))
+                return
+
+            self.send_response(302)
+            self.send_header("Location", url)
+            self.end_headers()
+
+        def inspect_xero_auth(self, config, state):
+            try:
+                parts = xero_authorize_parts(config, state)
+            except ValueError as exc:
+                self.send_error(400, str(exc))
+                return
+
+            rows = "\n".join(
+                "<tr>"
+                f"<th>{html.escape(key)}</th>"
+                f"<td>{html.escape(value)}</td>"
+                "</tr>"
+                for key, value in parts["params"].items()
+            )
+            body = (
+                "<!doctype html><html><head><meta charset=\"utf-8\">"
+                "<title>Xero auth inspector</title>"
+                "<style>body{font-family:Arial,sans-serif;margin:24px;}"
+                "table{border-collapse:collapse;}th,td{border:1px solid #ccc;"
+                "padding:6px 8px;text-align:left;}code{word-break:break-all;}"
+                "a{display:inline-block;margin:12px 0;}</style></head><body>"
+                "<h1>Xero auth inspector</h1>"
+                f"<p>Client ID tail: {html.escape(parts['clientIdTail'])}</p>"
+                f"<p>Base URL: <code>{html.escape(parts['baseUrl'])}</code></p>"
+                f"<table>{rows}</table>"
+                f"<p><a href=\"{html.escape(parts['url'])}\">Open this Xero auth URL</a></p>"
+                "</body></html>"
+            ).encode("utf-8")
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def handle_xero_callback(self, config, state):
+            query = parse_qs(urlparse(self.path).query)
+            if query.get("error"):
+                self.send_html_message("Xero connection failed", query["error"][0])
+                return
+
+            returned_state = query.get("state", [""])[0]
+            if returned_state != state.get("state"):
+                self.send_error(400, "Xero auth state did not match.")
+                return
+
+            code = query.get("code", [""])[0]
+            if not code:
+                self.send_error(400, "Xero callback did not include a code.")
+                return
+
+            try:
+                connections = exchange_xero_code(code, config, state)
+            except ValueError as exc:
+                self.send_html_message("Xero connection failed", str(exc))
+                return
+
+            if len(connections) == 1:
+                message = (
+                    "Connected to "
+                    f"{connections[0].get('tenantName', 'the selected organisation')}. "
+                    "You can close this tab and return to ParseProp."
+                )
+            elif len(connections) == 0:
+                message = (
+                    "Xero identity connected, but no organisations were returned. "
+                    "If you used OpenID-only scopes for testing, add an accounting "
+                    "scope such as accounting.invoices and reconnect."
+                )
+            else:
+                message = (
+                    f"Connected to {len(connections)} organisations. "
+                    "Tenant selection will be added before posting to Xero."
+                )
+            self.send_html_message("Xero connected", message)
 
         def send_pdf(self, request_path, paths):
             try:
@@ -492,9 +881,18 @@ def make_preview_handler(documents):
     return PreviewHandler
 
 
-def start_preview_server(documents, port, open_browser):
-    server = ThreadingHTTPServer(("127.0.0.1", port), make_preview_handler(documents))
-    url = f"http://127.0.0.1:{server.server_port}/"
+def start_preview_server(documents, host, port, open_browser, local_config):
+    class DeferredPortServer(ThreadingHTTPServer):
+        pass
+
+    server = DeferredPortServer((host, port), BaseHTTPRequestHandler)
+    server_port = server.server_port
+    server.RequestHandlerClass = make_preview_handler(
+        documents,
+        local_config,
+        server_port,
+    )
+    url = f"http://{host}:{server.server_port}/"
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
 
@@ -547,9 +945,12 @@ def main():
     try:
         profiles = load_profiles()
         global_settings = load_global_settings()
+        local_config = load_local_config()
     except Exception as exc:
         print(f"ERROR loading settings: {exc}")
         return 1
+
+    args.port = configured_port(local_config, args.port)
 
     exit_code = 0
     documents = []
@@ -576,7 +977,13 @@ def main():
             exit_code = 1
 
     if documents and not args.no_preview:
-        start_preview_server(documents, args.port, not args.no_browser)
+        start_preview_server(
+            documents,
+            configured_host(local_config),
+            args.port,
+            not args.no_browser,
+            local_config,
+        )
 
     return exit_code
 
