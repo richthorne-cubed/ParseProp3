@@ -87,6 +87,27 @@
       background: #ffffff;
     }
 
+    .doc-action {
+      min-height: 34px;
+      padding: 6px 12px;
+      border: 1px solid var(--control-line);
+      border-radius: 4px;
+      background: var(--control);
+      color: var(--text);
+      cursor: pointer;
+      font: inherit;
+      white-space: nowrap;
+    }
+
+    .doc-action:hover {
+      background: #ffffff;
+    }
+
+    .doc-action:disabled {
+      cursor: wait;
+      opacity: 0.7;
+    }
+
     .debug-link {
       color: var(--muted);
       font-size: 13px;
@@ -161,6 +182,41 @@
       font-variant-numeric: tabular-nums;
       font-weight: 700;
       text-align: right;
+    }
+
+    .doc-controls {
+      align-self: center;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      justify-content: flex-end;
+      flex-wrap: wrap;
+    }
+
+    .date-field {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--muted);
+      font-size: 13px;
+      white-space: nowrap;
+    }
+
+    .post-status {
+      color: var(--muted);
+      font-size: 13px;
+      min-width: 150px;
+      text-align: right;
+    }
+
+    input[type="date"] {
+      min-height: 32px;
+      padding: 4px 8px;
+      border: 1px solid var(--control-line);
+      border-radius: 4px;
+      background: var(--control);
+      color: var(--text);
+      font: inherit;
     }
 
     table {
@@ -334,10 +390,34 @@
       property.textContent = text(documentData.property && documentData.property.address);
       titleBlock.append(fileName, profile, property);
 
+      const controls = document.createElement("div");
+      controls.className = "doc-controls";
+
+      const dateField = document.createElement("label");
+      dateField.className = "date-field";
+      dateField.textContent = "Date";
+      const dateInput = document.createElement("input");
+      dateInput.type = "date";
+      dateInput.value = text(documentData.statementDate && documentData.statementDate.iso);
+      dateInput.dataset.documentIndex = String(index);
+      dateField.appendChild(dateInput);
+
+      const postStatus = document.createElement("div");
+      postStatus.className = "post-status";
+
+      const postButton = document.createElement("button");
+      postButton.className = "doc-action";
+      postButton.type = "button";
+      postButton.textContent = "Create draft invoice";
+      postButton.addEventListener("click", () => {
+        createDraftInvoice(section, documentData, index, postButton, postStatus);
+      });
+
       const total = document.createElement("div");
       total.className = "total";
       total.textContent = documentData.total;
-      meta.append(titleBlock, total);
+      controls.append(dateField, total, postButton, postStatus);
+      meta.append(titleBlock, controls);
 
       const table = document.createElement("table");
       const thead = document.createElement("thead");
@@ -353,7 +433,9 @@
       documentData.lines.forEach((line) => {
         const row = document.createElement("tr");
         const typeCell = makeCell("td", "");
-        typeCell.appendChild(makeTypeSelect(documentData.accountTypes, line.type));
+        const typeSelect = makeTypeSelect(documentData.accountTypes, line.type);
+        typeSelect.dataset.lineIndex = String(documentData.lines.indexOf(line));
+        typeCell.appendChild(typeSelect);
         row.append(
           makeCell("td", "description", line.description),
           typeCell,
@@ -366,6 +448,52 @@
       transactions.append(meta, table);
       section.append(preview, transactions);
       return section;
+    }
+
+    function collectDocumentSubmission(section, documentIndex) {
+      const dateInput = section.querySelector('input[type="date"]');
+      const selects = Array.from(section.querySelectorAll("tbody select"));
+
+      return {
+        documentIndex,
+        date: dateInput.value,
+        lines: selects.map((select) => ({
+          type: select.value
+        }))
+      };
+    }
+
+    async function createDraftInvoice(section, documentData, index, button, statusEl) {
+      if (!confirm(`Create a DRAFT sales invoice in Xero for ${documentData.fileName}?`)) {
+        return;
+      }
+
+      button.disabled = true;
+      statusEl.textContent = "Posting...";
+
+      try {
+        const response = await fetch("/xero/draft-invoice", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify(collectDocumentSubmission(section, index))
+        });
+        const result = await response.json();
+
+        if (!response.ok || !result.ok) {
+          throw new Error(result.error || `Xero request failed: ${response.status}`);
+        }
+
+        const invoice = result.invoice;
+        statusEl.textContent = invoice.invoiceNumber
+          ? `Draft ${invoice.invoiceNumber}`
+          : "Draft created";
+      } catch (error) {
+        statusEl.textContent = error.message;
+      } finally {
+        button.disabled = false;
+      }
     }
 
     async function loadPreview() {

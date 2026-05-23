@@ -28,6 +28,7 @@ LOCAL_TOKEN_PATH = Path(__file__).with_name("localtokens.json")
 XERO_AUTHORIZE_URL = "https://login.xero.com/identity/connect/authorize"
 XERO_TOKEN_URL = "https://identity.xero.com/connect/token"
 XERO_CONNECTIONS_URL = "https://api.xero.com/connections"
+XERO_INVOICES_URL = "https://api.xero.com/api.xro/2.0/Invoices"
 DEFAULT_XERO_SCOPES = [
     "openid",
     "profile",
@@ -37,6 +38,7 @@ DEFAULT_XERO_SCOPES = [
     "accounting.settings.read",
 ]
 AMOUNT_RE = re.compile(r"^(?:\u00c2?\u00a3)?[0-9][0-9,]*\.[0-9]+$")
+DATE_RE = re.compile(r"^\d{2}/\d{2}/\d{4}$")
 CID_ARTIFACT_RE = re.compile(r"\(cid:\d+\)")
 DESCRIPTION_REPLACEMENTS = {
     "\ufb00": "ff",
@@ -85,6 +87,32 @@ def save_local_tokens(tokens):
     with LOCAL_TOKEN_PATH.open("w", encoding="utf-8") as f:
         json.dump(tokens, f, indent=2)
         f.write("\n")
+
+
+def decimal_from_string(value):
+    try:
+        return Decimal(str(value))
+    except InvalidOperation as exc:
+        raise ValueError(f"Invalid decimal value: {value}") from exc
+
+
+def property_address_abbreviation(address):
+    parts = re.findall(r"[A-Za-z0-9]+", address)
+    if not parts:
+        raise ValueError("Cannot generate invoice number without a property address.")
+
+    first = parts[0].upper()
+    if any(char.isdigit() for char in first):
+        initials = "".join(part[0].upper() for part in parts[1:] if part)
+        return f"{first}{initials}"
+
+    return "".join(part[0].upper() for part in parts if part)
+
+
+def draft_invoice_number(invoice_date, property_info):
+    compact_date = invoice_date.replace("-", "")
+    address = property_info.get("address", "")
+    return f"LR-{compact_date}-{property_address_abbreviation(address)}"
 
 
 def configured_port(local_config, requested_port):
@@ -179,6 +207,31 @@ def find_property(words, profile):
         if property_info.get("address")
     )
     raise ValueError(f"No matching property address found. Expected one of: {addresses}")
+
+
+def date_to_iso(date_text):
+    day, month, year = date_text.split("/")
+    return f"{year}-{month}-{day}"
+
+
+def find_statement_date(words):
+    rows = grouped_rows(words)
+    for date_label in words:
+        if word_text(date_label) != "Date:":
+            continue
+
+        row_words = rows.get(date_label["doctop"], [])
+        for word in row_words:
+            text = word_text(word)
+            if word["x0"] > date_label["x0"] and DATE_RE.fullmatch(text):
+                return {
+                    "display": text,
+                    "iso": date_to_iso(text),
+                    "doctop": word["doctop"],
+                    "x0": word["x0"],
+                }
+
+    raise ValueError("Could not find statement date after 'Date:'.")
 
 
 def find_lower_bound(words, profile):
@@ -436,6 +489,7 @@ def extract_document(pdf_path, profiles, global_settings):
     words = extract_pdf_words(pdf_path)
     profile = find_profile(words, profiles)
     property_info = find_property(words, profile)
+    statement_date = find_statement_date(words)
     upper_bound = profile["ignoreBefore"]
     lower_bound = find_lower_bound(words, profile)
     lines = build_lines(words, profile, upper_bound, lower_bound)
@@ -446,7 +500,11 @@ def extract_document(pdf_path, profiles, global_settings):
         "path": str(pdf_path.resolve()),
         "fileName": pdf_path.name,
         "profileName": profile["profileName"],
+        "contactName": profile.get("contactName", ""),
+        "xeroTrackingCategory1": profile.get("xeroTrackingCategory1", ""),
+        "accountCodes": profile.get("accountCodes", {}),
         "property": property_info or {},
+        "statementDate": statement_date,
         "accountTypes": list(profile.get("accountCodes", {}).keys()),
         "lines": lines,
         "total": sum((line["amount"] for line in lines), Decimal("0")),
@@ -461,6 +519,7 @@ def print_document(document):
     print(f"Profile: {document['profileName']}")
     if document["property"].get("address"):
         print(f"Property: {document['property']['address']}")
+    print(f"Date: {document['statementDate']['display']}")
     print(f"Rows: {len(document['lines'])}")
     print()
     print_table(document["lines"])
@@ -473,7 +532,9 @@ def preview_json(documents):
             {
                 "fileName": document["fileName"],
                 "profileName": document["profileName"],
+                "contactName": document["contactName"],
                 "property": document["property"],
+                "statementDate": document["statementDate"],
                 "accountTypes": document["accountTypes"],
                 "total": format_amount(document["total"]),
                 "lines": [
@@ -639,6 +700,39 @@ def xero_post_token(form):
         raise ValueError(f"Xero token request failed: {exc.reason}") from exc
 
 
+def refresh_xero_token(local_config, tokens):
+    refresh_token = tokens.get("refresh_token")
+    if not refresh_token:
+        raise ValueError("No Xero refresh token found. Reconnect Xero first.")
+
+    token_set = xero_post_token(
+        {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": local_config["clientId"],
+        }
+    )
+    updated = {
+        **tokens,
+        **token_set,
+        "obtainedAt": int(time.time()),
+    }
+    save_local_tokens(updated)
+    return updated
+
+
+def valid_xero_tokens(local_config):
+    tokens = load_local_tokens()
+    if not tokens.get("access_token"):
+        raise ValueError("No Xero access token found. Connect Xero first.")
+
+    expires_at = int(tokens.get("obtainedAt", 0)) + int(tokens.get("expires_in", 0))
+    if expires_at <= int(time.time()) + 60:
+        return refresh_xero_token(local_config, tokens)
+
+    return tokens
+
+
 def xero_get_connections(access_token):
     request = Request(
         XERO_CONNECTIONS_URL,
@@ -655,6 +749,102 @@ def xero_get_connections(access_token):
         raise ValueError(f"Xero connections request failed: {read_http_error(exc)}") from exc
     except URLError as exc:
         raise ValueError(f"Xero connections request failed: {exc.reason}") from exc
+
+
+def xero_post_invoice(access_token, tenant_id, invoice):
+    body = json.dumps({"Invoices": [invoice]}).encode("utf-8")
+    request = Request(
+        XERO_INVOICES_URL,
+        data=body,
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+            "Xero-tenant-id": tenant_id,
+        },
+        method="POST",
+    )
+
+    try:
+        with urlopen(request, timeout=30) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        raise ValueError(f"Xero invoice request failed: {read_http_error(exc)}") from exc
+    except URLError as exc:
+        raise ValueError(f"Xero invoice request failed: {exc.reason}") from exc
+
+
+def build_draft_invoice(document, submitted_document):
+    invoice_date = submitted_document.get("date")
+    if not invoice_date:
+        raise ValueError("Invoice date is missing.")
+
+    if not document.get("contactName"):
+        raise ValueError("Profile is missing contactName.")
+
+    account_codes = document.get("accountCodes", {})
+    tracking_category = document.get("xeroTrackingCategory1")
+    tracking_option = document.get("property", {}).get("xeroTrackingOption")
+
+    submitted_lines = submitted_document.get("lines", [])
+    if len(submitted_lines) != len(document["lines"]):
+        raise ValueError("Submitted line count does not match extracted line count.")
+
+    line_items = []
+    for index, extracted_line in enumerate(document["lines"]):
+        submitted_line = submitted_lines[index]
+        line_type = submitted_line.get("type")
+        account_code = account_codes.get(line_type)
+        if account_code is None:
+            raise ValueError(f"No account code configured for type: {line_type}")
+
+        line_item = {
+            "Description": extracted_line["description"],
+            "Quantity": 1,
+            "UnitAmount": float(decimal_from_string(extracted_line["amount"])),
+            "AccountCode": str(account_code),
+        }
+
+        if tracking_category and tracking_option:
+            line_item["Tracking"] = [
+                {
+                    "Name": tracking_category,
+                    "Option": tracking_option,
+                }
+            ]
+
+        line_items.append(line_item)
+
+    return {
+        "Type": "ACCREC",
+        "Status": "DRAFT",
+        "Contact": {
+            "Name": document["contactName"],
+        },
+        "Date": invoice_date,
+        "DueDate": invoice_date,
+        "InvoiceNumber": draft_invoice_number(invoice_date, document.get("property", {})),
+        "LineAmountTypes": "NoTax",
+        "Reference": document["fileName"],
+        "LineItems": line_items,
+    }
+
+
+def create_draft_invoice(document, submitted_document, local_config):
+    tokens = valid_xero_tokens(local_config)
+    tenant_id = tokens.get("selectedTenantId")
+    if not tenant_id:
+        raise ValueError("No Xero tenant selected. Reconnect Xero first.")
+
+    invoice = build_draft_invoice(document, submitted_document)
+    response = xero_post_invoice(tokens["access_token"], tenant_id, invoice)
+    created = response.get("Invoices", [{}])[0]
+    return {
+        "invoiceId": created.get("InvoiceID", ""),
+        "invoiceNumber": created.get("InvoiceNumber", ""),
+        "status": created.get("Status", ""),
+        "total": created.get("Total", ""),
+    }
 
 
 def exchange_xero_code(code, local_config, auth_state):
@@ -692,6 +882,15 @@ def make_preview_handler(documents, local_config, server_port):
     auth_state = {}
 
     class PreviewHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            path = unquote(self.path.split("?", 1)[0])
+
+            if path == "/xero/draft-invoice":
+                self.handle_draft_invoice(local_config)
+                return
+
+            self.send_error(404)
+
         def do_GET(self):
             path = unquote(self.path.split("?", 1)[0])
 
@@ -753,6 +952,37 @@ def make_preview_handler(documents, local_config, server_port):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        def read_json_body(self):
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError as exc:
+                raise ValueError("Invalid request content length.") from exc
+
+            try:
+                return json.loads(self.rfile.read(length).decode("utf-8"))
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSON request: {exc.msg}") from exc
+
+        def send_error_json(self, status, message):
+            body = json.dumps({"ok": False, "error": message}).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def handle_draft_invoice(self, config):
+            try:
+                submitted = self.read_json_body()
+                document_index = int(submitted.get("documentIndex"))
+                document = documents[document_index]
+                result = create_draft_invoice(document, submitted, config)
+            except (ValueError, IndexError, TypeError) as exc:
+                self.send_error_json(400, str(exc))
+                return
+
+            self.send_json({"ok": True, "invoice": result})
 
         def send_html_message(self, title, message):
             body = (
@@ -899,15 +1129,17 @@ def start_preview_server(documents, host, port, open_browser, local_config):
     print(f"Preview: {url}")
     if open_browser:
         webbrowser.open(url)
-    print("Press Ctrl+C to stop the preview server.")
+    print("Press Enter to stop the preview server and exit.")
 
     try:
-        thread.join()
+        input()
     except KeyboardInterrupt:
         print()
+    finally:
         print("Stopping preview server.")
         server.shutdown()
         server.server_close()
+        thread.join(timeout=5)
 
 
 def parse_args():
