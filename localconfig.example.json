@@ -1,0 +1,12 @@
+{
+ "clientId": "###FROMXERODEVELOPERPLATFORM###",
+ "redirectUri": "http://localhost:8765/xero/callback",
+ "scopes": [
+  "openid",
+  "profile",
+  "email",
+  "offline_access",
+  "accounting.invoices",
+  "accounting.settings.read"
+ ]
+}
