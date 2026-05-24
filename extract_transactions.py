@@ -296,6 +296,14 @@ def candidate_description_words(words, amount_line, profile):
 
 
 def description_for_amount(words, rows, amount_line, profile):
+    declared_description = declared_outside_description(
+        rows,
+        amount_line,
+        profile,
+    )
+    if declared_description is not None:
+        return declared_description
+
     selected = []
     last_doctop = None
 
@@ -325,6 +333,26 @@ def description_for_amount(words, rows, amount_line, profile):
     return None
 
 
+def declared_outside_description(rows, amount_line, profile):
+    row_words = [
+        word
+        for word in rows.get(amount_line["doctop"], [])
+        if word is not amount_line["word"]
+    ]
+    row_texts = [word_text(word) for word in row_words]
+
+    for description in profile.get("descsOutsideRange", []):
+        description_words = description.split()
+        if not description_words:
+            continue
+
+        for start_index in range(len(row_texts) - len(description_words) + 1):
+            if row_texts[start_index:start_index + len(description_words)] == description_words:
+                return description
+
+    return None
+
+
 def build_lines(words, profile, upper_bound, lower_bound):
     rows = grouped_rows(words)
     amounts = find_amounts(words, profile, upper_bound, lower_bound)
@@ -333,10 +361,11 @@ def build_lines(words, profile, upper_bound, lower_bound):
     for amount_line in amounts:
         description = description_for_amount(words, rows, amount_line, profile)
         if description is None:
-            raise ValueError(
-                "Could not find description for amount "
+            print(
+                "WARNING: skipping amount without description "
                 f"{amount_line['raw']} at doctop {amount_line['doctop']}"
             )
+            continue
         description = normalize_description(description)
         if description in profile.get("descIgnore", []):
             continue

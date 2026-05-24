@@ -4,12 +4,15 @@
    "rent for period",
    "rent received",
    "received from",
-   "rent from"
+   "rent from",
+   "rent charge",
+   "paid - "
   ],
   "mgmt":	[
    "management fee",
    "commission fee",
-   "renewal fee"
+   "renewal fee",
+   "inspection fee"
   ],
   "lettingfee":	[
    "tenant find fee",
